@@ -1,10 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-Анализ актов v2.9.9 (основная ветка: Общ_Сводная).
-База: act_analysis_branch_DP v1.0 + учёт актов из Общей сводной без вхождения в Сводную ГП.
-Добавлено: столбец G «DP», сдвиг выходных колонок C:V.
-Устойчивость: обрабатывает пропуски в столбце B (пустые ячейки между актами).
-Важно: акт отображается, если он есть в Общей сводной, даже если отсутствует в Сводной ГП.
+Анализ актов v3.0.0 (основная ветка разработки).
+База: v2.9.9 (ветка Общ_Сводная).
+Добавлено:
+  - параллельное чтение источников по ПК (ThreadPoolExecutor);
+  - точные денежные расчёты через decimal.Decimal (ROUND_HALF_UP до 2 знаков);
+  - пакетная подсветка столбца B блоками одного цвета (меньше вызовов COM);
+  - отключение EnableEvents/DisplayAlerts на время записи с сохранением/восстановлением;
+  - фикс AttributeError 'int' object has no attribute 'quantize' (dec2 приводит любой тип);
+  - счётчики марок (cnt, o_cnt) переведены на Decimal для единообразия типов.
 Запуск:
     python act_analysis.py          — обновить цифры для текущего списка в B
     python act_analysis.py collect  — пересобрать список актов из сводных
@@ -14,6 +18,8 @@ import sys
 import time
 import re
 from pathlib import Path
+from decimal import Decimal, ROUND_HALF_UP
+from concurrent.futures import ThreadPoolExecutor
 
 # ------------------ настройки источников ------------------
 GP_PATH = (
@@ -49,9 +55,48 @@ LAST_TABLE = 28                              # AB — все столбцы с �
 OGZ_PREFIXES = ("100б", "100н", "100холд")
 SPECIAL_PREFIXES = OGZ_PREFIXES + ("100дс",)
 
-VERSION = "2.9.9"
+VERSION = "3.0.0"
+
+CENT = Decimal("0.01")
 
 # ------------------ вспомогательные функции ------------------
+def dec2(v):
+    """Приводит любое значение (int, float, str, Decimal, None) к Decimal
+    с арифметическим округлением до 2 знаков (ROUND_HALF_UP).
+    Нечисловые значения трактуются как 0.00. Фикс бага v2.9.9:
+    'int' object has no attribute 'quantize'."""
+    if v is None or isinstance(v, bool):
+        return Decimal("0.00")
+    if isinstance(v, Decimal):
+        d = v
+    elif isinstance(v, int):
+        d = Decimal(v)
+    elif isinstance(v, float):
+        d = Decimal(repr(v))
+    else:
+        s = txt(v).replace(" ", "").replace(",", ".")
+        try:
+            d = Decimal(s)
+        except Exception:
+            return Decimal("0.00")
+    return d.quantize(CENT, rounding=ROUND_HALF_UP)
+
+def num_dec(v):
+    """Как num(), но возвращает Decimal (или None, если значения нет)."""
+    if v is None or isinstance(v, bool):
+        return None
+    if isinstance(v, Decimal):
+        return v
+    if isinstance(v, (int, float)):
+        return dec2(v)
+    s = txt(v).replace(" ", "").replace(",", ".")
+    if not s:
+        return None
+    try:
+        return dec2(s)
+    except Exception:
+        return None
+
 def cell(row, i):
     return row[i] if i < len(row) else None
 
@@ -170,11 +215,13 @@ def sort_key(act):
 # ------------------ чтение источников ------------------
 def read_gp(path, exec_str):
     """-> (agg: act->[sumS, ogz, svarka, prot, weld, ogz_area, cnt],
-           sts: act->set, dps: act->set)"""
+           sts: act->set, dps: act->set)
+    Все суммы и счётчики — Decimal (точные денежные расчёты)."""
     from python_calamine import CalamineWorkbook
     wb = CalamineWorkbook.from_path(str(path))
     rows = wb.get_sheet_by_name("ГПВ КМ").to_python()
     agg, sts, dps = {}, {}, {}
+    Z = Decimal("0.00")
     for row in rows[SKIP_ROWS:]:
         act = txt(cell(row, GP_AI))
         if not act:
@@ -185,23 +232,23 @@ def read_gp(path, exec_str):
         if dp:
             dps.setdefault(act, set()).add(dp)
         st = txt(cell(row, GP_AM))
-        s = num(cell(row, GP_S))
-        w = num(cell(row, GP_W))
-        area = num(cell(row, GP_AB))
+        s = num_dec(cell(row, GP_S))
+        w = num_dec(cell(row, GP_W))
+        area = num_dec(cell(row, GP_AB))
         a = agg.get(act)
         if a is None:
-            a = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0]
+            a = [Z, Z, Z, Z, Z, Z, Decimal(0)]
             agg[act] = a
         if s is not None:
             a[0] += s
         cls = classify(st, exec_str)
         if cls == "ogz":
-            a[1] += s if s else 0.0
-            a[5] += area if area else 0.0
+            a[1] += s if s else Z
+            a[5] += area if area else Z
         elif cls == "svarka":
-            a[2] += s if s else 0.0
+            a[2] += s if s else Z
         elif cls == "prot":
-            a[3] += s if s else 0.0
+            a[3] += s if s else Z
         if w is not None:
             a[4] += w
         a[6] += 1
@@ -210,7 +257,7 @@ def read_gp(path, exec_str):
     return agg, sts, dps
 
 def read_ob(path):
-    """-> agg: act->[cnt, sumW]"""
+    """-> agg: act->[cnt, sumW]. cnt/sumW — Decimal."""
     from python_calamine import CalamineWorkbook
     wb = CalamineWorkbook.from_path(str(path))
     rows = wb.get_sheet_by_name("Сводная КМ").to_python()
@@ -221,10 +268,10 @@ def read_ob(path):
             continue
         if not txt(cell(row, OB_J)):
             continue
-        w = num(cell(row, OB_W))
+        w = num_dec(cell(row, OB_W))
         a = agg.get(act)
         if a is None:
-            a = [0.0, 0.0]
+            a = [Decimal(0), Decimal("0.00")]
             agg[act] = a
         a[0] += 1
         if w is not None:
@@ -232,7 +279,7 @@ def read_ob(path):
     return agg
 
 def read_metizy(path):
-    """-> agg: act->[sum_G, sum_H, sum_J] (к освоению, ВПБ, по ИД)"""
+    """-> agg: act->[sum_G, sum_H, sum_J] (к освоению, ВПБ, по ИД). Decimal."""
     from python_calamine import CalamineWorkbook
     wb = CalamineWorkbook.from_path(str(path))
     rows = wb.get_sheet_by_name("Метизы").to_python()
@@ -241,12 +288,12 @@ def read_metizy(path):
         act = txt(cell(row, MET_D))
         if not act:
             continue
-        g = num(cell(row, MET_G))
-        h = num(cell(row, MET_H))
-        j = num(cell(row, MET_J))
+        g = num_dec(cell(row, MET_G))
+        h = num_dec(cell(row, MET_H))
+        j = num_dec(cell(row, MET_J))
         a = agg.get(act)
         if a is None:
-            a = [0.0, 0.0, 0.0]
+            a = [Decimal("0.00"), Decimal("0.00"), Decimal("0.00")]
             agg[act] = a
         if g is not None:
             a[0] += g
@@ -265,7 +312,7 @@ def main():
     t0 = time.time()
 
     def die(msg, code=1):
-        win32api.MessageBox(0, msg, "act_analysis_branch_DP", win32con.MB_ICONERROR)
+        win32api.MessageBox(0, msg, "Анализ актов v" + VERSION, win32con.MB_ICONERROR)
         print(msg)
         return code
 
@@ -317,9 +364,13 @@ def main():
             warns.append("Нет листа Метизы по %s (%s)." % (pc, e))
         print(pc, "read %.1fs" % (time.time() - t1))
 
+    def load_all(pcs):
+        """v3.0.0: параллельное чтение источников по ПК (I/O-bound, сеть)."""
+        with ThreadPoolExecutor(max_workers=max(1, len(pcs))) as ex:
+            list(ex.map(load_pc, pcs))
+
     if collect:
-        for pc in ("ПК1", "ПК2", "ПК3"):
-            load_pc(pc)
+        load_all(("ПК1", "ПК2", "ПК3"))
         found = set()
         for gp in gp_by_pc.values():
             if not gp:
@@ -356,9 +407,9 @@ def main():
                 pc = pc_of(title_of(act))
                 if pc and pc not in pcs:
                     pcs.append(pc)
-        for pc in pcs:
-            load_pc(pc)
+        load_all(pcs)
 
+    Z = Decimal("0.00")
     rows_out = []
     past_flags = []
     nf = no_src = unk = empty_cnt = first_cnt = 0
@@ -375,7 +426,7 @@ def main():
 
         if not pc:
             unk += 1
-            rows_out.append(base + ["—", "—"] + [0.0] * 11 + [0.0, 0.0, 0.0])
+            rows_out.append(base + ["—", "—"] + [Z] * 14)
             past_flags.append(False)
             continue
 
@@ -387,8 +438,7 @@ def main():
 
         if not in_gp and not in_ob:
             nf += 1
-            rows_out.append(base + ["НЕ НАЙДЕНО", "НЕ НАЙДЕНО"]
-                            + [0.0] * 11 + [0.0, 0.0, 0.0])
+            rows_out.append(base + ["НЕ НАЙДЕНО", "НЕ НАЙДЕНО"] + [Z] * 14)
             past_flags.append(False)
             continue
 
@@ -404,7 +454,7 @@ def main():
                 first_cnt += 1
             dp = ", ".join(sorted(dps.get(act, ()))) if dps.get(act) else "—"
         else:
-            sum_s = ogz = svarka = prot = weld = ogz_area = cnt = 0.0
+            sum_s = ogz = svarka = prot = weld = ogz_area = cnt = Z
             st_list = []
             g = "(нет в Сводной ГП)"
             past = False
@@ -414,18 +464,20 @@ def main():
         if in_ob:
             o_cnt, o_w = ob[act]
         else:
-            o_cnt = o_w = 0.0
+            o_cnt = o_w = Z
 
-        vals = [sum_s, o_w, prot, sum_s - prot, ogz, ogz_area, svarka,
-                ogz + svarka, weld, float(cnt), o_cnt]
+        # точные денежные расчёты в Decimal с квантованием до 2 знаков
+        vals = [dec2(sum_s), dec2(o_w), dec2(prot), dec2(sum_s - prot),
+                dec2(ogz), dec2(ogz_area), dec2(svarka),
+                dec2(ogz + svarka), dec2(weld), dec2(cnt), dec2(o_cnt)]
 
         # ---------- метизы (независимо от ГП) ----------
         met = met_by_pc.get(pc)
         if met and act in met:
             met_g, met_h, met_j = met[act]
-            met_vals = [met_j, met_h, met_g]
+            met_vals = [dec2(met_j), dec2(met_h), dec2(met_g)]
         else:
-            met_vals = [0.0, 0.0, 0.0]
+            met_vals = [Z, Z, Z]
 
         row = base + [dp, g] + vals + met_vals
         rows_out.append(row)
@@ -436,9 +488,32 @@ def main():
         detail = "; ".join(f"строка {i+3}: {n} вместо {TOTAL_COLS}" for i, n in bad_rows[:5])
         return die(f"Внутренняя ошибка: рваный блок строк.\n{detail}")
     # ---------- запись через COM ----------
+    # v3.0.0: сохраняем исходное состояние Excel и отключаем события/диалоги
+    old_calc = None
+    try:
+        old_calc = xl.Calculation
+    except Exception:
+        pass
+    try:
+        old_events = xl.EnableEvents
+    except Exception:
+        old_events = True
+    try:
+        old_alerts = xl.DisplayAlerts
+    except Exception:
+        old_alerts = True
+
     xl.Calculation = XL_MANUAL
     xl.CalculateBeforeSave = False
     xl.ScreenUpdating = False
+    try:
+        xl.EnableEvents = False
+    except Exception:
+        pass
+    try:
+        xl.DisplayAlerts = False
+    except Exception:
+        pass
     try:
         last_a = ws.Cells(ws.Rows.Count, 1).End(XL_UP).Row
         if last_a > last_b and txt(ws.Cells(last_a, 1).Value) == "ИТОГО":
@@ -472,12 +547,23 @@ def main():
 
         ws.Range(ws.Cells(3, 9), ws.Cells(last_b, LAST_OUTPUT)).NumberFormatLocal = "# ##0,00"
 
-        for i, past in enumerate(past_flags):
-            r = 3 + i
-            if past:
-                ws.Cells(r, 2).Interior.Color = LIGHT_BLUE
-            else:
-                ws.Cells(r, 2).Interior.ColorIndex = -4142
+        # ---------- пакетная подсветка столбца B (v3.0.0) ----------
+        # Красим блоками одного цвета: прогоняем past_flags и выделяем
+        # непрерывные серии одинакового состояния — меньше вызовов COM.
+        if last_b >= 3:
+            n = len(past_flags)
+            i = 0
+            while i < n:
+                j = i
+                while j < n and past_flags[j] == past_flags[i]:
+                    j += 1
+                r1, r2 = 3 + i, 3 + j - 1
+                rng = ws.Range(ws.Cells(r1, 2), ws.Cells(r2, 2))
+                if past_flags[i]:
+                    rng.Interior.Color = LIGHT_BLUE
+                else:
+                    rng.Interior.ColorIndex = -4142
+                i = j
 
         try:
             if ws.AutoFilterMode:
@@ -494,6 +580,20 @@ def main():
             pass
     finally:
         xl.ScreenUpdating = True
+        # v3.0.0: восстановление исходного состояния Excel
+        try:
+            xl.EnableEvents = old_events
+        except Exception:
+            pass
+        try:
+            xl.DisplayAlerts = old_alerts
+        except Exception:
+            pass
+        if old_calc is not None:
+            try:
+                xl.Calculation = old_calc
+            except Exception:
+                pass
 
     msg = ("Готово за %.0f с.\nКнига «%s», лист «%s», выполнение %s.\n"
            "Строк: %d (пустых: %d); НЕ НАЙДЕНО: %d; нет источника: %d; ПК не распознан: %d.\n"
@@ -505,7 +605,7 @@ def main():
     if warns:
         msg += "\n\nПредупреждения:\n" + "\n".join(warns)
     print(msg)
-    win32api.MessageBox(0, msg, "act_analysis_branch_DP", win32con.MB_ICONINFORMATION)
+    win32api.MessageBox(0, msg, "Анализ актов v" + VERSION, win32con.MB_ICONINFORMATION)
     return 0
 
 if __name__ == "__main__":
