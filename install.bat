@@ -62,37 +62,18 @@ echo.
 
 rem ----- проверка библиотек -----
 echo Проверка импорта библиотек ...
-(
-echo import sys
-echo mods = ['calamine', 'openpyxl', 'win32com', 'win32api', 'win32con']
-echo failed = []
-echo for m in mods:
-echo     try:
-echo         __import^(m^)
-echo         print('  OK  ', m)
-echo     except Exception as e:
-echo         print('  FAIL', m, '-', e)
-echo         failed.append(m)
-echo if failed:
-echo     print('Не удалось импортировать:', ', '.join(failed))
-echo     sys.exit^(1^)
-echo print('Все библиотеки доступны.')
-) > _check_imports.py
+copy /y "%SCRIPT_DIR%_check_imports.py" _check_imports.py >nul
+if not exist _check_imports.py (
+    echo [ОШИБКА] Не найден файл _check_imports.py рядом с install.bat.
+    goto :fail_end
+)
 python _check_imports.py
 if errorlevel 1 goto :err_libs
 del /q _check_imports.py 2>nul
 
 rem ----- проверка Excel (опционально, информация) -----
 echo Проверка доступа к Excel ...
-(
-echo import win32com.client
-echo try:
-echo     xl = win32com.client.GetActiveObject('Excel.Application')
-echo     ver = xl.Version
-echo     print('  OK  Excel запущен, версия:', ver)
-echo except Exception:
-echo     print('  INFO Excel не запущен ^(запустится при первом вызове скрипта^)')
-) > _check_excel.py
+copy /y "%SCRIPT_DIR%_check_excel.py" _check_excel.py >nul
 python _check_excel.py
 del /q _check_excel.py 2>nul
 echo.
