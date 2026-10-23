@@ -1,5 +1,17 @@
 # История обновлений — Анализ актов
 
+## v3.0.2.2 — Фикс импорта calamine
+**База:** v3.0.2.1
+
+### Исправлено
+- **`_check_imports.py`: проверка `import calamine` → `python_calamine`** — пакет ставится через pip как `python-calamine`, но импортируется как `python_calamine`. Проверка в установщике искала несуществующий модуль `calamine` и всегда падала с `ModuleNotFoundError`, хотя сам `act_analysis.py` импортирует корректно (`from python_calamine import CalamineWorkbook`).
+- Добавлена проверка совместимости API: `CalamineWorkbook.from_path`, `get_sheet_by_name`, `CalamineSheet.to_python`.
+
+### Новое
+- **`_test_import.py`** — тестовый скрипт: импортирует все сторонние библиотеки, проверяет API `python_calamine` и модули проекта (`config`, `act_analysis` на Windows). Выводит «Все импорты OK» при успехе.
+
+---
+
 ## v3.0.2.1 — Фикс установщика (install.bat)
 
 ### Исправлено
