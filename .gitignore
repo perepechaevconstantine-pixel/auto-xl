@@ -1,2 +1,7 @@
 *.zip
 *.bundle
+__pycache__/
+*.pyc
+logs/
+*.bundle
+auto-xl_*.zip*
