@@ -1,78 +1,67 @@
 @echo off
-chcp 65001 >nul
+chcp 866 >nul
 setlocal enabledelayedexpansion
 
 rem ========================================================================
-rem install.bat тАФ ╤Г╤Б╤В╨░╨╜╨╛╨▓╨║╨░ ╨╛╨║╤А╤Г╨╢╨╡╨╜╨╕╤П ╨┤╨╗╤П act_analysis (v3.0.1)
+rem install.bat - установка окружения для act_analysis (v3.0.2)
 rem ========================================================================
 
 echo.
 echo ========================================================================
-echo  ╨г╤Б╤В╨░╨╜╨╛╨▓╨║╨░ ╨╛╨║╤А╤Г╨╢╨╡╨╜╨╕╤П ╨┤╨╗╤П ╨Р╨╜╨░╨╗╨╕╨╖ ╨░╨║╤В╨╛╨▓ v3.0.1
+echo  Установка окружения для Анализ актов v3.0.2
 echo ========================================================================
 echo.
 
-rem ----- ╨╛╨┐╤А╨╡╨┤╨╡╨╗╨╡╨╜╨╕╨╡ ╨┐╨░╨┐╨║╨╕ ╤Б╨║╤А╨╕╨┐╤В╨░ -----
+rem ----- определение папки скрипта -----
 set "SCRIPT_DIR=%~dp0"
 cd /d "%SCRIPT_DIR%"
 
-echo ╨в╨╡╨║╤Г╤Й╨░╤П ╨┐╨░╨┐╨║╨░: %CD%
+echo Текущая папка: %CD%
 echo.
 
-rem ----- ╨┐╤А╨╛╨▓╨╡╤А╨║╨░ Python -----
+rem ----- проверка Python -----
+set "PY="
 where python >nul 2>&1
-if errorlevel 1 (
-    where py >nul 2>&1
-    if errorlevel 1 (
-        echo [╨Ю╨и╨Ш╨С╨Ъ╨Р] Python ╨╜╨╡ ╨╜╨░╨╣╨┤╨╡╨╜ ╨▓ PATH.
-        echo ╨г╤Б╤В╨░╨╜╨╛╨▓╨╕╤В╨╡ Python 3.10+ ╤Б https://www.python.org/downloads/
-        echo ╨╕ ╨┤╨╛╨▒╨░╨▓╤М╤В╨╡ ╨╡╨│╨╛ ╨▓ PATH ╨┐╤А╨╕ ╤Г╤Б╤В╨░╨╜╨╛╨▓╨║╨╡ (╨│╨░╨╗╨╛╤З╨║╨░ "Add Python to PATH").
-        echo.
-        pause
-        exit /b 1
-    ) else (
-        set "PY=py"
-    )
-) else (
-    set "PY=python"
-)
+if not errorlevel 1 set "PY=python"
+if defined PY goto :py_ok
+where py >nul 2>&1
+if not errorlevel 1 set "PY=py"
+if defined PY goto :py_ok
+echo [ОШИБКА] Python не найден в PATH.
+echo Установите Python 3.10+ с https://www.python.org/downloads/
+echo и добавьте его в PATH при установке (галочка "Add Python to PATH").
+echo.
+pause
+exit /b 1
+:py_ok
 
-echo ╨Э╨░╨╣╨┤╨╡╨╜ Python:
+echo Найден Python:
 %PY% --version
 echo.
 
-rem ----- ╨┐╤А╨╛╨▓╨╡╤А╨║╨░ venv -----
-if not exist ".venv\Scripts\activate.bat" (
-    echo ╨б╨╛╨╖╨┤╨░╨╜╨╕╨╡ ╨▓╨╕╤А╤В╤Г╨░╨╗╤М╨╜╨╛╨│╨╛ ╨╛╨║╤А╤Г╨╢╨╡╨╜╨╕╤П .venv ...
-    %PY% -m venv .venv
-    if errorlevel 1 (
-        echo [╨Ю╨и╨Ш╨С╨Ъ╨Р] ╨Э╨╡ ╤Г╨┤╨░╨╗╨╛╤Б╤М ╤Б╨╛╨╖╨┤╨░╤В╤М ╨▓╨╕╤А╤В╤Г╨░╨╗╤М╨╜╨╛╨╡ ╨╛╨║╤А╤Г╨╢╨╡╨╜╨╕╨╡.
-        echo.
-        pause
-        exit /b 1
-    )
-    echo ╨У╨╛╤В╨╛╨▓╨╛.
-) else (
-    echo ╨Т╨╕╤А╤В╤Г╨░╨╗╤М╨╜╨╛╨╡ ╨╛╨║╤А╤Г╨╢╨╡╨╜╨╕╨╡ .venv ╤Г╨╢╨╡ ╤Б╤Г╤Й╨╡╤Б╤В╨▓╤Г╨╡╤В.
-)
+rem ----- проверка venv -----
+if exist ".venv\Scripts\activate.bat" goto :venv_skip
+echo Создание виртуального окружения .venv ...
+%PY% -m venv .venv
+if errorlevel 1 goto :err_venv
+echo Готово.
+goto :venv_done
+:venv_skip
+echo Виртуальное окружение .venv уже существует.
+:venv_done
 echo.
 
-rem ----- ╤Г╤Б╤В╨░╨╜╨╛╨▓╨║╨░ ╨╖╨░╨▓╨╕╤Б╨╕╨╝╨╛╤Б╤В╨╡╨╣ -----
-echo ╨г╤Б╤В╨░╨╜╨╛╨▓╨║╨░ ╨╖╨░╨▓╨╕╤Б╨╕╨╝╨╛╤Б╤В╨╡╨╣ ╨╕╨╖ requirements.txt ...
+rem ----- установка зависимостей -----
+echo Установка зависимостей из requirements.txt ...
 call .venv\Scripts\activate.bat
 python -m pip install --upgrade pip >nul 2>&1
 python -m pip install -r requirements.txt
-if errorlevel 1 (
-    echo [╨Ю╨и╨Ш╨С╨Ъ╨Р] ╨Э╨╡ ╤Г╨┤╨░╨╗╨╛╤Б╤М ╤Г╤Б╤В╨░╨╜╨╛╨▓╨╕╤В╤М ╨╖╨░╨▓╨╕╤Б╨╕╨╝╨╛╤Б╤В╨╕.
-    echo.
-    pause
-    exit /b 1
-)
-echo ╨У╨╛╤В╨╛╨▓╨╛.
+if errorlevel 1 goto :err_pip
+echo Готово.
 echo.
 
-rem ----- ╨┐╤А╨╛╨▓╨╡╤А╨║╨░ ╨▒╨╕╨▒╨╗╨╕╨╛╤В╨╡╨║ -----
-echo ╨Я╤А╨╛╨▓╨╡╤А╨║╨░ ╨╕╨╝╨┐╨╛╤А╤В╨░ ╨▒╨╕╨▒╨╗╨╕╨╛╤В╨╡╨║ ...
+rem ----- проверка библиотек -----
+echo Проверка импорта библиотек ...
 (
 echo import sys
 echo mods = ['calamine', 'openpyxl', 'win32com', 'win32api', 'win32con']
@@ -85,47 +74,62 @@ echo     except Exception as e:
 echo         print('  FAIL', m, '-', e)
 echo         failed.append(m)
 echo if failed:
-echo     print('╨Э╨╡ ╤Г╨┤╨░╨╗╨╛╤Б╤М ╨╕╨╝╨┐╨╛╤А╤В╨╕╤А╨╛╨▓╨░╤В╤М:', ', '.join(failed))
+echo     print('Не удалось импортировать:', ', '.join(failed))
 echo     sys.exit(1)
-echo print('╨Т╤Б╨╡ ╨▒╨╕╨▒╨╗╨╕╨╛╤В╨╡╨║╨╕ ╨┤╨╛╤Б╤В╤Г╨┐╨╜╤Л.')
+echo print('Все библиотеки доступны.')
 ) > _check_imports.py
 python _check_imports.py
-set "CHECK_ERR=!errorlevel!"
+if errorlevel 1 goto :err_libs
 del /q _check_imports.py 2>nul
-if not "!CHECK_ERR!"=="0" (
-    echo [╨Ю╨и╨Ш╨С╨Ъ╨Р] ╨Э╨╡╨║╨╛╤В╨╛╤А╤Л╨╡ ╨▒╨╕╨▒╨╗╨╕╨╛╤В╨╡╨║╨╕ ╨╜╨╡ ╨╕╨╝╨┐╨╛╤А╤В╨╕╤А╤Г╤О╤В╤Б╤П.
-    echo.
-    pause
-    exit /b 1
-)
 
-rem ----- ╨┐╤А╨╛╨▓╨╡╤А╨║╨░ Excel (╨╛╨┐╤Ж╨╕╨╛╨╜╨░╨╗╤М╨╜╨╛, ╨╕╨╜╤Д╨╛╤А╨╝╨░╤Ж╨╕╤П) -----
-echo ╨Я╤А╨╛╨▓╨╡╤А╨║╨░ ╨┤╨╛╤Б╤В╤Г╨┐╨░ ╨║ Excel ...
+rem ----- проверка Excel (опционально, информация) -----
+echo Проверка доступа к Excel ...
 (
 echo import win32com.client
 echo try:
 echo     xl = win32com.client.GetActiveObject('Excel.Application')
 echo     ver = xl.Version
-echo     print('  OK  Excel ╨╖╨░╨┐╤Г╤Й╨╡╨╜, ╨▓╨╡╤А╤Б╨╕╤П:', ver)
+echo     print('  OK  Excel запущен, версия:', ver)
 echo except Exception:
-echo     print('  INFO Excel ╨╜╨╡ ╨╖╨░╨┐╤Г╤Й╨╡╨╜ ^(╨╖╨░╨┐╤Г╤Б╤В╨╕╤В╤Б╤П ╨┐╤А╨╕ ╨┐╨╡╤А╨▓╨╛╨╝ ╨▓╤Л╨╖╨╛╨▓╨╡ ╤Б╨║╤А╨╕╨┐╤В╨░^)')
+echo     print('  INFO Excel не запущен ^(запустится при первом вызове скрипта^)')
 ) > _check_excel.py
 python _check_excel.py
 del /q _check_excel.py 2>nul
 echo.
 
-rem ----- ╨╕╤В╨╛╨│ -----
+goto :ok_end
+
+rem ----- обработчики ошибок -----
+:err_venv
+echo [ОШИБКА] Не удалось создать виртуальное окружение.
+goto :fail_end
+
+:err_pip
+echo [ОШИБКА] Не удалось установить зависимости.
+goto :fail_end
+
+:err_libs
+echo [ОШИБКА] Некоторые библиотеки не импортируются.
+goto :fail_end
+
+:fail_end
+echo.
+pause
+exit /b 1
+
+rem ----- итог -----
+:ok_end
 echo ========================================================================
-echo  ╨г╤Б╤В╨░╨╜╨╛╨▓╨║╨░ ╨╖╨░╨▓╨╡╤А╤И╨╡╨╜╨░ ╤Г╤Б╨┐╨╡╤И╨╜╨╛.
+echo  Установка завершена успешно.
 echo ========================================================================
 echo.
-echo ╨Ф╨╗╤П ╨╖╨░╨┐╤Г╤Б╨║╨░ ╨░╨╜╨░╨╗╨╕╨╖╨░:
+echo Для запуска анализа:
 echo   cd /d "%SCRIPT_DIR%"
 echo   call .venv\Scripts\activate.bat
 echo   python act_analysis.py
-echo   ╨╕╨╗╨╕
+echo   или
 echo   python act_analysis.py collect
 echo.
-echo ╨Я╨╛╨┤╤А╨╛╨▒╨╜╨╡╨╡ ╤З╨╕╤В╨░╨╣╤В╨╡ ╨▓ ╤Д╨░╨╣╨╗╨╡ INSTALL.md
+echo Подробнее читайте в файле INSTALL.md
 echo.
 pause
