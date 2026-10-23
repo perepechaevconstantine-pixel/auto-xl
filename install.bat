@@ -3,12 +3,12 @@ chcp 65001 >nul
 setlocal enabledelayedexpansion
 
 rem ========================================================================
-rem install.bat — установка окружения для act_analysis_branch_DP
+rem install.bat — установка окружения для act_analysis (v3.0.1)
 rem ========================================================================
 
 echo.
 echo ========================================================================
-echo  Установка окружения для act_analysis_branch_DP
+echo  Установка окружения для Анализ актов v3.0.1
 echo ========================================================================
 echo.
 
@@ -73,25 +73,26 @@ echo.
 
 rem ----- проверка библиотек -----
 echo Проверка импорта библиотек ...
-python -c "
-import sys
-mods = ['calamine', 'openpyxl', 'win32com', 'win32api', 'win32con']
-failed = []
-for m in mods:
-    try:
-        __import__(m)
-        print('  OK  ', m)
-    except Exception as e:
-        print('  FAIL', m, '-', e)
-        failed.append(m)
-if failed:
-    print()
-    print('Не удалось импортировать:', ', '.join(failed))
-    sys.exit(1)
-print()
-print('Все библиотеки доступны.')
-"
-if errorlevel 1 (
+(
+echo import sys
+echo mods = ['calamine', 'openpyxl', 'win32com', 'win32api', 'win32con']
+echo failed = []
+echo for m in mods:
+echo     try:
+echo         __import^(m^)
+echo         print('  OK  ', m)
+echo     except Exception as e:
+echo         print('  FAIL', m, '-', e)
+echo         failed.append(m)
+echo if failed:
+echo     print('Не удалось импортировать:', ', '.join(failed))
+echo     sys.exit(1)
+echo print('Все библиотеки доступны.')
+) > _check_imports.py
+python _check_imports.py
+set "CHECK_ERR=!errorlevel!"
+del /q _check_imports.py 2>nul
+if not "!CHECK_ERR!"=="0" (
     echo [ОШИБКА] Некоторые библиотеки не импортируются.
     echo.
     pause
@@ -100,14 +101,17 @@ if errorlevel 1 (
 
 rem ----- проверка Excel (опционально, информация) -----
 echo Проверка доступа к Excel ...
-python -c "
-import win32com.client
-try:
-    xl = win32com.client.GetActiveObject('Excel.Application')
-    print('  OK  Excel запущен (версия:', xl.Version, ')')
-except Exception:
-    print('  INFO Excel не запущен (запустится при первом вызове скрипта)')
-"
+(
+echo import win32com.client
+echo try:
+echo     xl = win32com.client.GetActiveObject('Excel.Application')
+echo     ver = xl.Version
+echo     print('  OK  Excel запущен, версия:', ver)
+echo except Exception:
+echo     print('  INFO Excel не запущен ^(запустится при первом вызове скрипта^)')
+) > _check_excel.py
+python _check_excel.py
+del /q _check_excel.py 2>nul
 echo.
 
 rem ----- итог -----

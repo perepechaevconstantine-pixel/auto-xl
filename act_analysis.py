@@ -1,38 +1,130 @@
 # -*- coding: utf-8 -*-
 """
-Анализ актов v3.0.0 (основная ветка разработки).
-База: v2.9.9 (ветка Общ_Сводная).
-Добавлено:
-  - параллельное чтение источников по ПК (ThreadPoolExecutor);
-  - точные денежные расчёты через decimal.Decimal (ROUND_HALF_UP до 2 знаков);
-  - пакетная подсветка столбца B блоками одного цвета (меньше вызовов COM);
-  - отключение EnableEvents/DisplayAlerts на время записи с сохранением/восстановлением;
-  - фикс AttributeError 'int' object has no attribute 'quantize' (dec2 приводит любой тип);
-  - счётчики марок (cnt, o_cnt) переведены на Decimal для единообразия типов.
+Анализ актов v3.0.1 (основная ветка разработки, ревизия после восстановления v3.0.0).
+История изменений — см. CHANGELOG.md.
+База: v3.0.0 (Decimal-расчёты, параллельное чтение, пакетная подсветка,
+             EnableEvents/DisplayAlerts save-restore, фикс quantize).
+Добавлено в v3.0.1:
+  - портативная конфигурация путей к источникам: config.py / config.json,
+    CLI-переопределение --gp/--ob, диалог выбора папок при первом запуске;
+  - папка logs/ с логом критических ошибок.
 Запуск:
-    python act_analysis.py          — обновить цифры для текущего списка в B
-    python act_analysis.py collect  — пересобрать список актов из сводных
+    python act_analysis.py                — обновить цифры для текущего списка в B
+    python act_analysis.py collect        — пересобрать список актов из сводных
+    python act_analysis.py --gp PATH --ob PATH [collect]  — переопределить пути
 """
 
 import sys
+import os
+import json
 import time
 import re
 from pathlib import Path
 from decimal import Decimal, ROUND_HALF_UP
 from concurrent.futures import ThreadPoolExecutor
 
-# ------------------ настройки источников ------------------
-GP_PATH = (
+# ------------------ настройки источников (портативные) ------------------
+# Источники подключаются шаблоном пути, где {pc} — номер Пункта Комплексной
+# сборки (1/2/3). Пути берутся (в порядке приоритета):
+#   1. CLI:         --gp PATH --ob PATH
+#   2. config.py:   GP_PATH_TEMPLATE / OB_PATH_TEMPLATE (жёсткая настройка)
+#   3. config.json: автосоздаётся при первом запуске (диалог выбора папки)
+DEFAULT_GP_TEMPLATE = (
     r"\\vls.lan\ULSPG-DFS\ПТО\04. Завод СПГ_Рабочая общая"
     r"\02. Отчёты по исполнительной документации\Группа КМ\3. Генподряд"
-    r"\!СВОДНЫЕ ГП КМ\Сводная_ГП_КМ_ПК"
+    r"\!СВОДНЫЕ ГП КМ\Сводная_ГП_КМ_ПК{pc}.xlsb"
 )
-OB_PATH = (
+DEFAULT_OB_TEMPLATE = (
     r"\\vls.lan\ULSPG-DFS\ПТО\04. Завод СПГ_Рабочая общая"
     r"\02. Отчёты по исполнительной документации"
     r"\ОБЩАЯ Сводная таблица по статусу объекта СПГ КМ (по линиям)"
-    r"\ОБЩАЯ Сводная таблица по статусу объекта СПГ КМ (ПК"
+    r"\ОБЩАЯ Сводная таблица по статусу объекта СПГ КМ (ПК{pc}).xlsb"
 )
+
+BASE_DIR = Path(__file__).resolve().parent
+CONFIG_JSON = BASE_DIR / "config.json"
+LOGS_DIR = BASE_DIR / "logs"
+
+
+def load_config():
+    """-> (gp_template, ob_template). config.py имеет приоритет над config.json."""
+    gp, ob = DEFAULT_GP_TEMPLATE, DEFAULT_OB_TEMPLATE
+    cfg_py = BASE_DIR / "config.py"
+    if cfg_py.exists():
+        try:
+            import config as _cfg
+            # берём только реально заданные значения; закомментированный
+            # шаблон не должен отключать config.json
+            py_gp = getattr(_cfg, "GP_PATH_TEMPLATE", None)
+            py_ob = getattr(_cfg, "OB_PATH_TEMPLATE", None)
+            if py_gp or py_ob:
+                return py_gp or gp, py_ob or ob
+        except Exception as e:
+            print("config.py не загружен (%s), используем config.json" % e)
+    if CONFIG_JSON.exists():
+        try:
+            with open(CONFIG_JSON, encoding="utf-8") as f:
+                data = json.load(f)
+            gp = data.get("gp_template", gp)
+            ob = data.get("ob_template", ob)
+        except Exception as e:
+            print("config.json повреждён (%s), используем значения по умолчанию" % e)
+    return gp, ob
+
+
+def ask_folder(title):
+    """Диалог выбора папки (Windows). Fallback — ввод путём в консоли."""
+    path = None
+    try:
+        import win32com.client as _wc
+        shell = _wc.Dispatch("Shell.Application")
+        folder = shell.BrowseForFolder(0, title, 0x0051, "")
+        if folder is not None:
+            path = folder.Self.Path
+    except Exception:
+        pass
+    if path is None:
+        try:
+            path = input(title.replace("\n", " ") + " Введите путь к папке с источниками: ").strip()
+        except EOFError:
+            path = ""
+    return path or None
+
+
+def ensure_paths_interactive(gp_tmpl, ob_tmpl):
+    """Если файлов по шаблонам нет — спросить папки у пользователя и сохранить config.json."""
+    changed = False
+    for n in ("1", "2", "3"):
+        if os.path.exists(gp_tmpl.format(pc=n)):
+            break
+    else:
+        folder = ask_folder("Не найдены файлы «Сводная_ГП_КМ_ПК*.xlsb».\n"
+                            "Выберите папку с Сводными ГП:")
+        if folder:
+            gp_tmpl = os.path.join(folder, "Сводная_ГП_КМ_ПК{pc}.xlsb")
+            changed = True
+    for n in ("1", "2", "3"):
+        if os.path.exists(ob_tmpl.format(pc=n)):
+            break
+    else:
+        folder = ask_folder("Не найдены файлы «ОБЩАЯ Сводная ... (ПК*).xlsb».\n"
+                            "Выберите папку с Общей сводной:")
+        if folder:
+            ob_tmpl = os.path.join(
+                folder, "ОБЩАЯ Сводная таблица по статусу объекта СПГ КМ (ПК{pc}).xlsb")
+            changed = True
+    if changed:
+        try:
+            with open(CONFIG_JSON, "w", encoding="utf-8") as f:
+                json.dump({"gp_template": gp_tmpl, "ob_template": ob_tmpl},
+                          f, ensure_ascii=False, indent=2)
+            print("Пути сохранены в", CONFIG_JSON)
+        except Exception as e:
+            print("Не удалось сохранить config.json:", e)
+    return gp_tmpl, ob_tmpl
+
+
+GP_TEMPLATE, OB_TEMPLATE = load_config()
 
 # ------------------ столбцы источников (0-based) ------------------
 GP_J, GP_S, GP_W, GP_AB, GP_AI, GP_AM = 9, 18, 22, 27, 34, 38
@@ -55,7 +147,7 @@ LAST_TABLE = 28                              # AB — все столбцы с �
 OGZ_PREFIXES = ("100б", "100н", "100холд")
 SPECIAL_PREFIXES = OGZ_PREFIXES + ("100дс",)
 
-VERSION = "3.0.0"
+VERSION = "3.0.1"
 
 CENT = Decimal("0.01")
 
@@ -316,7 +408,23 @@ def main():
         print(msg)
         return code
 
-    collect = len(sys.argv) > 1 and sys.argv[1].strip().lower() == "collect"
+    collect = False
+    gp_tmpl, ob_tmpl = GP_TEMPLATE, OB_TEMPLATE
+    args = sys.argv[1:]
+    i = 0
+    while i < len(args):
+        a = args[i].strip().lower()
+        if a == "--gp" and i + 1 < len(args):
+            gp_tmpl = args[i + 1]
+            i += 2
+        elif a == "--ob" and i + 1 < len(args):
+            ob_tmpl = args[i + 1]
+            i += 2
+        elif a == "collect":
+            collect = True
+            i += 1
+        else:
+            i += 1
 
     try:
         xl = wc.GetActiveObject("Excel.Application")
@@ -344,21 +452,26 @@ def main():
     gp_by_pc, ob_by_pc, met_by_pc = {}, {}, {}
     warns = []
 
+    # v3.0.1: если пути из конфига не ведут к файлам — спросим у пользователя
+    if not any(os.path.exists(gp_tmpl.format(pc=n)) for n in ("1", "2", "3")) or \
+       not any(os.path.exists(ob_tmpl.format(pc=n)) for n in ("1", "2", "3")):
+        gp_tmpl, ob_tmpl = ensure_paths_interactive(gp_tmpl, ob_tmpl)
+
     def load_pc(pc):
         n = pc[2]
         t1 = time.time()
         try:
-            gp_by_pc[pc] = read_gp(GP_PATH + n + ".xlsb", exec_str)
+            gp_by_pc[pc] = read_gp(gp_tmpl.format(pc=n), exec_str)
         except Exception as e:
             gp_by_pc[pc] = None
             warns.append("Нет источника ГП по %s (%s)." % (pc, e))
         try:
-            ob_by_pc[pc] = read_ob(OB_PATH + n + ").xlsb")
+            ob_by_pc[pc] = read_ob(ob_tmpl.format(pc=n))
         except Exception as e:
             ob_by_pc[pc] = None
             warns.append("Нет источника Общей по %s (%s)." % (pc, e))
         try:
-            met_by_pc[pc] = read_metizy(GP_PATH + n + ".xlsb")
+            met_by_pc[pc] = read_metizy(gp_tmpl.format(pc=n))
         except Exception as e:
             met_by_pc[pc] = None
             warns.append("Нет листа Метизы по %s (%s)." % (pc, e))
@@ -613,12 +726,20 @@ if __name__ == "__main__":
         sys.exit(main())
     except Exception as exc:
         import traceback
-        err_path = Path(__file__).resolve().parent / "last_error.txt"
         tb = traceback.format_exc()
-        with open(err_path, "w", encoding="utf-8") as f:
+        here = Path(__file__).resolve().parent
+        with open(here / "last_error.txt", "w", encoding="utf-8") as f:
             f.write(tb)
+        try:
+            logs = here / "logs"
+            logs.mkdir(exist_ok=True)
+            log_name = "error_" + time.strftime("%Y-%m-%d_%H%M%S") + ".log"
+            with open(logs / log_name, "w", encoding="utf-8") as f:
+                f.write(tb)
+        except Exception:
+            pass
         print("КРИТИЧЕСКАЯ ОШИБКА:\n" + tb)
-        print("\nОшибка записана в:", err_path)
+        print("\nОшибка записана в:", here / "last_error.txt")
         try:
             win32api.MessageBox(0, tb, "Анализ актов v" + VERSION, win32con.MB_ICONERROR)
         except Exception:
