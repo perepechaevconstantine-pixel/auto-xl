@@ -75,7 +75,7 @@ echo         print('  FAIL', m, '-', e)
 echo         failed.append(m)
 echo if failed:
 echo     print('Не удалось импортировать:', ', '.join(failed))
-echo     sys.exit(1)
+echo     sys.exit^(1^)
 echo print('Все библиотеки доступны.')
 ) > _check_imports.py
 python _check_imports.py
