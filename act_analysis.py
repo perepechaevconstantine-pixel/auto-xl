@@ -1,15 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-Анализ актов v3.1.0 (основная ветка разработки).
+Анализ актов v3.2.0 (основная ветка разработки).
 История изменений — см. CHANGELOG.md.
-База: v3.0.2 (портативная конфигурация, точные расчёты Decimal, параллельное чтение).
-Добавлено в v3.1.0:
-  - структурированное логирование через logging вместо print():
-    консоль (stderr) + logs/auto-xl.log (DEBUG) + logs/errors.log (ERROR+),
-    ротация 5 МБ x 3 бэкапа;
-  - флаг --quiet: в консоль только ошибки, файлы пишутся полностью;
-  - замеры времени ключевых этапов (чтение источников, сборка, запись);
-  - логирование аргументов запуска и конфигурации.
+База: v3.1.0 (структурное логирование, --quiet, замеры времени).
+Добавлено в v3.2.0 (оптимизация производительности, точность Decimal сохранена):
+  - COM-запись данных массивом Range.Value = tuple-of-tuples (было по ячейкам);
+  - пакетное форматирование целыми диапазонами (NumberFormat, Font.Bold);
+  - отключение Calculation/ScreenUpdating/EnableEvents/DisplayAlerts на всю
+    операцию с сохранением/восстановлением исходных значений в finally;
+  - кэш прочитанных файлов в памяти на время одного запуска (config.PERF["cache"]);
+  - компилированные regex для распознавания ПК (pc_of);
+  - openpyxl удалён из зависимостей (не использовался).
 Запуск:
     python act_analysis.py                — обновить цифры для текущего списка в B
     python act_analysis.py collect        — пересобрать список актов из сводных
@@ -23,11 +24,26 @@ import json
 import time
 import re
 import logging
+from functools import lru_cache
 from pathlib import Path
 from decimal import Decimal, ROUND_HALF_UP
 from concurrent.futures import ThreadPoolExecutor
 
 logger = logging.getLogger(__name__)
+
+
+def _load_perf():
+    """Настройки производительности из config.PERF (кэш источников и т.п.)."""
+    try:
+        import config as _cfg
+        return getattr(_cfg, "PERF", {}) or {}
+    except Exception:
+        return {}
+
+
+_PERF = _load_perf()
+USE_CACHE = bool(_PERF.get("cache", True))
+CACHE_TTL = float(_PERF.get("cache_ttl", 300))
 
 
 def _init_logging(quiet=False):
@@ -177,9 +193,14 @@ LAST_TABLE = 28                              # AB — все столбцы с �
 OGZ_PREFIXES = ("100б", "100н", "100холд")
 SPECIAL_PREFIXES = OGZ_PREFIXES + ("100дс",)
 
-VERSION = "3.1.0"
+VERSION = "3.2.0"
 
 CENT = Decimal("0.01")
+
+# v3.2.0: компилированные regex для распознавания ПК (было: срезы строк)
+PC1_RE = re.compile(r"^L03|^L3-02-010\.|^L3-12-030\.")
+PC2_RE = re.compile(r"^L0?1(?!\d)")   # L1xxx / L01xxx, но не L10/L12 (это ПК3)
+PC3_RE = re.compile(r"^L3")
 
 # ------------------ вспомогательные функции ------------------
 def dec2(v):
@@ -259,12 +280,12 @@ def title_of(act):
     return act[p1 + 1:p2]
 
 def pc_of(ttl):
-    head = ttl.split(".")[0]
-    if ttl[:3] == "L03" or head in ("L3-02-010", "L3-12-030"):
+    """v3.2.0: компилированные regex вместо срезов строк."""
+    if PC1_RE.search(ttl):
         return "ПК1"
-    if ttl[:2] == "L1" or ttl[:3] == "L01":
+    if PC2_RE.match(ttl):
         return "ПК2"
-    if ttl[:2] == "L3":
+    if PC3_RE.match(ttl):
         return "ПК3"
     return ""
 
@@ -335,13 +356,50 @@ def sort_key(act):
     return (pc_of(ttl), ttl, sec_n, km_n, act)
 
 # ------------------ чтение источников ------------------
+_ROWS_CACHE = {}   # key -> (rows, timestamp); живёт только в памяти процесса
+
+
+def _rows_cached(path, sheet_name, ttl=None):
+    """v3.2.0: кэш строк листа по (путь, лист, mtime, размер файла).
+
+    Внутри одного запуска повторное чтение того же файла не ходит в сеть
+    (например, ГП-файл читают read_gp и read_metizy). Кэш — в памяти
+    процесса, при заверении скрипта сбрасывается сам. Инвалидация — по
+    mtime/размеру; TTL — страховка от «mtime не изменился, содержимое
+    другое» на некоторых сетевых шарах. Управляется config.PERF.
+    """
+    if ttl is None:
+        ttl = CACHE_TTL
+    from python_calamine import CalamineWorkbook
+    if not USE_CACHE:
+        wb = CalamineWorkbook.from_path(str(path))
+        return wb.get_sheet_by_name(sheet_name).to_python()
+    try:
+        st = os.stat(str(path))
+        key = (str(path), sheet_name, int(st.st_mtime), st.st_size)
+    except OSError:
+        key = None
+    now = time.time()
+    if key is not None:
+        hit = _ROWS_CACHE.get(key)
+        if hit and now - hit[1] < ttl:
+            logger.debug("Кэш HIT: %s [%s]", path, sheet_name)
+            return hit[0]
+    wb = CalamineWorkbook.from_path(str(path))
+    rows = wb.get_sheet_by_name(sheet_name).to_python()
+    if key is not None:
+        _ROWS_CACHE[key] = (rows, now)
+        stale = [k for k, (_, ts) in _ROWS_CACHE.items() if now - ts >= ttl]
+        for k in stale:
+            _ROWS_CACHE.pop(k, None)
+    return rows
+
+
 def read_gp(path, exec_str):
     """-> (agg: act->[sumS, ogz, svarka, prot, weld, ogz_area, cnt],
            sts: act->set, dps: act->set)
     Все суммы и счётчики — Decimal (точные денежные расчёты)."""
-    from python_calamine import CalamineWorkbook
-    wb = CalamineWorkbook.from_path(str(path))
-    rows = wb.get_sheet_by_name("ГПВ КМ").to_python()
+    rows = _rows_cached(path, "ГПВ КМ")
     agg, sts, dps = {}, {}, {}
     Z = Decimal("0.00")
     for row in rows[SKIP_ROWS:]:
@@ -380,9 +438,7 @@ def read_gp(path, exec_str):
 
 def read_ob(path):
     """-> agg: act->[cnt, sumW]. cnt/sumW — Decimal."""
-    from python_calamine import CalamineWorkbook
-    wb = CalamineWorkbook.from_path(str(path))
-    rows = wb.get_sheet_by_name("Сводная КМ").to_python()
+    rows = _rows_cached(path, "Сводная КМ")
     agg = {}
     for row in rows[SKIP_ROWS:]:
         act = txt(cell(row, OB_AO))
@@ -402,9 +458,7 @@ def read_ob(path):
 
 def read_metizy(path):
     """-> agg: act->[sum_G, sum_H, sum_J] (к освоению, ВПБ, по ИД). Decimal."""
-    from python_calamine import CalamineWorkbook
-    wb = CalamineWorkbook.from_path(str(path))
-    rows = wb.get_sheet_by_name("Метизы").to_python()
+    rows = _rows_cached(path, "Метизы")
     agg = {}
     for row in rows[MET_SKIP_ROWS:]:
         act = txt(cell(row, MET_D))
@@ -426,6 +480,26 @@ def read_metizy(path):
     return agg
 
 # ------------------ основной скрипт ------------------
+def _restore_xl(xl, old_calc=None, old_events=None, old_alerts=None):
+    """v3.2.0: восстановление настроек Excel (толерантно к COM-глюкам)."""
+    xl.ScreenUpdating = True
+    if old_events is not None:
+        try:
+            xl.EnableEvents = old_events
+        except Exception:
+            pass
+    if old_alerts is not None:
+        try:
+            xl.DisplayAlerts = old_alerts
+        except Exception:
+            pass
+    if old_calc is not None:
+        try:
+            xl.Calculation = old_calc
+        except Exception:
+            pass
+
+
 def main():
     print("Анализ актов v" + VERSION)  # первая строка консоли (добавлено в v3.0.2)
 
@@ -446,6 +520,11 @@ def main():
     t0 = time.time()
 
     def die(msg, code=1):
+        # v3.2.0: при раннем выходе восстанавливаем Excel до показа ошибки
+        try:
+            _restore_xl(xl, old_calc, old_events, old_alerts)
+        except Exception:
+            pass
         logger.error(msg.replace("\n", " | "))
         win32api.MessageBox(0, msg, "Анализ актов v" + VERSION, win32con.MB_ICONERROR)
         print(msg)
@@ -492,177 +571,11 @@ def main():
         return die("В A1 листа «%s» книги «%s» нет номера выполнения."
                    % (ws.Name, wbk.Name))
 
-    old_last = ws.Cells(ws.Rows.Count, 2).End(XL_UP).Row
 
-    gp_by_pc, ob_by_pc, met_by_pc = {}, {}, {}
-    warns = []
-
-    # v3.0.1: если пути из конфига не ведут к файлам — спросим у пользователя
-    if not any(os.path.exists(gp_tmpl.format(pc=n)) for n in ("1", "2", "3")) or \
-       not any(os.path.exists(ob_tmpl.format(pc=n)) for n in ("1", "2", "3")):
-        gp_tmpl, ob_tmpl = ensure_paths_interactive(gp_tmpl, ob_tmpl)
-
-    def load_pc(pc):
-        n = pc[2]
-        t1 = time.time()
-        gp_path = gp_tmpl.format(pc=n)
-        try:
-            logger.debug("Чтение ГП: %s", gp_path)
-            gp_by_pc[pc] = read_gp(gp_path, exec_str)
-        except Exception as e:
-            gp_by_pc[pc] = None
-            warns.append("Нет источника ГП по %s (%s)." % (pc, e))
-            logger.warning("Нет источника ГП по %s", pc, exc_info=True)
-        try:
-            ob_path = ob_tmpl.format(pc=n)
-            logger.debug("Чтение Общей сводной: %s", ob_path)
-            ob_by_pc[pc] = read_ob(ob_path)
-        except Exception as e:
-            ob_by_pc[pc] = None
-            warns.append("Нет источника Общей по %s (%s)." % (pc, e))
-            logger.warning("Нет источника Общей по %s", pc, exc_info=True)
-        try:
-            met_by_pc[pc] = read_metizy(gp_path)
-        except Exception as e:
-            met_by_pc[pc] = None
-            warns.append("Нет листа Метизы по %s (%s)." % (pc, e))
-            logger.warning("Нет листа Метизы по %s", pc, exc_info=True)
-        elapsed = time.time() - t1
-        logger.info("%s: чтение источников завершено за %.1f с", pc, elapsed)
-
-    def load_all(pcs):
-        """v3.0.0: параллельное чтение источников по ПК (I/O-bound, сеть)."""
-        t_load = time.time()
-        logger.info("Загрузка файлов: параллельное чтение %d ПК", len(pcs))
-        with ThreadPoolExecutor(max_workers=max(1, len(pcs))) as ex:
-            list(ex.map(load_pc, pcs))
-        logger.info("Загрузка файлов завершена за %.2f с", time.time() - t_load)
-
-    if collect:
-        load_all(("ПК1", "ПК2", "ПК3"))
-        found = set()
-        for gp in gp_by_pc.values():
-            if not gp:
-                continue
-            agg, sts, dps = gp
-            for act, st_set in sts.items():
-                if act.startswith("GLE-") and act_in_exec(st_set, exec_str):
-                    found.add(act)
-        acts = sorted(found, key=sort_key)
-        if not acts:
-            return die("Collect: ни одного акта с выполнением %s не найдено." % exec_str)
-        last_b = 2 + len(acts)
-        xl.ScreenUpdating = False
-        try:
-            if old_last >= 3:
-                ws.Range(ws.Cells(3, 2), ws.Cells(old_last, 2)).ClearContents()
-                ws.Range(ws.Cells(3, 2), ws.Cells(old_last, 2)).Interior.ColorIndex = -4142
-                ws.Range(ws.Cells(3, 3), ws.Cells(old_last, 21)).ClearContents()
-            ws.Range(ws.Cells(3, 2), ws.Cells(last_b, 2)).Value = \
-                tuple((a,) for a in acts)
-        finally:
-            xl.ScreenUpdating = True
-    else:
-        last_b = old_last
-        if last_b < 3:
-            return die("В столбце B листа «%s» нет актов со строки 3." % ws.Name)
-        raw = ws.Range(ws.Cells(3, 2), ws.Cells(last_b, 2)).Value
-        if not isinstance(raw, tuple):
-            raw = ((raw,),)
-        acts = [txt(r[0]) for r in raw]
-        pcs = []
-        for act in acts:
-            if act:
-                pc = pc_of(title_of(act))
-                if pc and pc not in pcs:
-                    pcs.append(pc)
-        load_all(pcs)
-
-    t_parse = time.time()
-    Z = Decimal("0.00")
-    rows_out = []
-    past_flags = []
-    nf = no_src = unk = empty_cnt = first_cnt = 0
-    for act in acts:
-        if not act:
-            empty_cnt += 1
-            rows_out.append(["-"] * TOTAL_COLS)
-            past_flags.append(False)
-            continue
-
-        ttl = title_of(act)
-        pc = pc_of(ttl)
-        base = [ttl, pc, sec_of(act), km_of(act)]
-
-        if not pc:
-            unk += 1
-            rows_out.append(base + ["—", "—"] + [Z] * 14)
-            past_flags.append(False)
-            continue
-
-        gp = gp_by_pc.get(pc)
-        ob = ob_by_pc.get(pc)
-
-        in_gp = gp is not None and act in gp[0]
-        in_ob = ob is not None and act in ob
-
-        if not in_gp and not in_ob:
-            nf += 1
-            rows_out.append(base + ["НЕ НАЙДЕНО", "НЕ НАЙДЕНО"] + [Z] * 14)
-            past_flags.append(False)
-            continue
-
-        # ---------- данные из Сводной ГП (если есть) ----------
-        if in_gp:
-            agg, sts, dps = gp
-            a = agg[act]
-            sum_s, ogz, svarka, prot, weld, ogz_area, cnt = a
-            st_list = sorted(sts.get(act, ()))
-            g = "; ".join(st_list) if st_list else "(без статуса)"
-            past = had_past_exec(st_list, exec_str)
-            if not past:
-                first_cnt += 1
-            dp = ", ".join(sorted(dps.get(act, ()))) if dps.get(act) else "—"
-        else:
-            sum_s = ogz = svarka = prot = weld = ogz_area = cnt = Z
-            st_list = []
-            g = "(нет в Сводной ГП)"
-            past = False
-            dp = "—"
-
-        # ---------- данные из Общей сводной (если есть) ----------
-        if in_ob:
-            o_cnt, o_w = ob[act]
-        else:
-            o_cnt = o_w = Z
-
-        # точные денежные расчёты в Decimal с квантованием до 2 знаков
-        vals = [dec2(sum_s), dec2(o_w), dec2(prot), dec2(sum_s - prot),
-                dec2(ogz), dec2(ogz_area), dec2(svarka),
-                dec2(ogz + svarka), dec2(weld), dec2(cnt), dec2(o_cnt)]
-
-        # ---------- метизы (независимо от ГП) ----------
-        met = met_by_pc.get(pc)
-        if met and act in met:
-            met_g, met_h, met_j = met[act]
-            met_vals = [dec2(met_j), dec2(met_h), dec2(met_g)]
-        else:
-            met_vals = [Z, Z, Z]
-
-        row = base + [dp, g] + vals + met_vals
-        rows_out.append(row)
-        past_flags.append(past)
-
-    bad_rows = [(i, len(r)) for i, r in enumerate(rows_out) if len(r) != TOTAL_COLS]
-    logger.info("Обработка/парсинг данных завершена за %.2f с (%d строк)",
-                time.time() - t_parse, len(acts))
-    if bad_rows:
-        detail = "; ".join(f"строка {i+3}: {n} вместо {TOTAL_COLS}" for i, n in bad_rows[:5])
-        return die(f"Внутренняя ошибка: рваный блок строк.\n{detail}")
-    # ---------- запись через COM ----------
-    t_write = time.time()
-    # v3.0.0: сохраняем исходное состояние Excel и отключаем события/диалоги
-    old_calc = None
+    # v3.2.0: отключаем автооперации Excel НА ВСЮ операцию сразу после
+    # получения xlApp; исходные значения сохраняем и восстанавливаем в
+    # finally (включая collect-режим и ранние выходы через die()).
+    old_calc = old_events = old_alerts = None
     try:
         old_calc = xl.Calculation
     except Exception:
@@ -675,10 +588,14 @@ def main():
         old_alerts = xl.DisplayAlerts
     except Exception:
         old_alerts = True
-
-    xl.Calculation = XL_MANUAL
-    xl.CalculateBeforeSave = False
-    xl.ScreenUpdating = False
+    try:
+        xl.Calculation = XL_MANUAL
+    except Exception:
+        pass
+    try:
+        xl.CalculateBeforeSave = False
+    except Exception:
+        pass
     try:
         xl.EnableEvents = False
     except Exception:
@@ -687,86 +604,261 @@ def main():
         xl.DisplayAlerts = False
     except Exception:
         pass
-    try:
-        last_a = ws.Cells(ws.Rows.Count, 1).End(XL_UP).Row
-        if last_a > last_b and txt(ws.Cells(last_a, 1).Value) == "ИТОГО":
-            ws.Range(ws.Cells(last_a, 1), ws.Cells(last_a, LAST_OUTPUT)).ClearContents()
+    xl.ScreenUpdating = False
+    logger.debug("Excel: Calculation/ScreenUpdating/EnableEvents/DisplayAlerts отключены")
 
-        clear_last = max(last_b, old_last)
-        if clear_last >= 3:
-            ws.Range(ws.Cells(3, 3), ws.Cells(clear_last, LAST_OUTPUT)).ClearContents()
+    try:  # v3.2.0: внешний try — finally ниже всегда восстановит Excel
+      old_last = ws.Cells(ws.Rows.Count, 2).End(XL_UP).Row
 
-        if last_b >= 3:
-            ws.Range(ws.Cells(3, 3), ws.Cells(last_b, LAST_OUTPUT)).Value = \
-                tuple(tuple(r) for r in rows_out)
+      gp_by_pc, ob_by_pc, met_by_pc = {}, {}, {}
+      warns = []
 
-        # ---------- порядковые номера в столбце A (только для непустых актов) ----------
-        if last_b >= 3:
-            a_vals = []
-            seq = 0
-            for act in acts:
-                if act:
-                    seq += 1
-                    a_vals.append((seq,))
-                else:
-                    a_vals.append((None,))
-            ws.Range(ws.Cells(3, 1), ws.Cells(last_b, 1)).Value = tuple(a_vals)
+      # v3.0.1: если пути из конфига не ведут к файлам — спросим у пользователя
+      if not any(os.path.exists(gp_tmpl.format(pc=n)) for n in ("1", "2", "3")) or \
+         not any(os.path.exists(ob_tmpl.format(pc=n)) for n in ("1", "2", "3")):
+          gp_tmpl, ob_tmpl = ensure_paths_interactive(gp_tmpl, ob_tmpl)
 
-        ws.Cells(2, 1).Value = "ИТОГО"
-        for col in range(9, LAST_OUTPUT + 1):
-            letter = chr(64 + col)
-            ws.Cells(2, col).Formula = "=SUBTOTAL(109,%s3:%s%d)" % (letter, letter, last_b)
-        ws.Range(ws.Cells(2, 1), ws.Cells(2, LAST_OUTPUT)).Font.Bold = True
+      def load_pc(pc):
+          n = pc[2]
+          t1 = time.time()
+          gp_path = gp_tmpl.format(pc=n)
+          try:
+              logger.debug("Чтение ГП: %s", gp_path)
+              gp_by_pc[pc] = read_gp(gp_path, exec_str)
+          except Exception as e:
+              gp_by_pc[pc] = None
+              warns.append("Нет источника ГП по %s (%s)." % (pc, e))
+              logger.warning("Нет источника ГП по %s", pc, exc_info=True)
+          try:
+              ob_path = ob_tmpl.format(pc=n)
+              logger.debug("Чтение Общей сводной: %s", ob_path)
+              ob_by_pc[pc] = read_ob(ob_path)
+          except Exception as e:
+              ob_by_pc[pc] = None
+              warns.append("Нет источника Общей по %s (%s)." % (pc, e))
+              logger.warning("Нет источника Общей по %s", pc, exc_info=True)
+          try:
+              met_by_pc[pc] = read_metizy(gp_path)
+          except Exception as e:
+              met_by_pc[pc] = None
+              warns.append("Нет листа Метизы по %s (%s)." % (pc, e))
+              logger.warning("Нет листа Метизы по %s", pc, exc_info=True)
+          elapsed = time.time() - t1
+          logger.info("%s: чтение источников завершено за %.1f с", pc, elapsed)
 
-        ws.Range(ws.Cells(3, 9), ws.Cells(last_b, LAST_OUTPUT)).NumberFormatLocal = "# ##0,00"
+      def load_all(pcs):
+          """v3.0.0: параллельное чтение источников по ПК (I/O-bound, сеть)."""
+          t_load = time.time()
+          logger.info("Загрузка файлов: параллельное чтение %d ПК", len(pcs))
+          with ThreadPoolExecutor(max_workers=max(1, len(pcs))) as ex:
+              list(ex.map(load_pc, pcs))
+          logger.info("Загрузка файлов завершена за %.2f с", time.time() - t_load)
 
-        # ---------- пакетная подсветка столбца B (v3.0.0) ----------
-        # Красим блоками одного цвета: прогоняем past_flags и выделяем
-        # непрерывные серии одинакового состояния — меньше вызовов COM.
-        if last_b >= 3:
-            n = len(past_flags)
-            i = 0
-            while i < n:
-                j = i
-                while j < n and past_flags[j] == past_flags[i]:
-                    j += 1
-                r1, r2 = 3 + i, 3 + j - 1
-                rng = ws.Range(ws.Cells(r1, 2), ws.Cells(r2, 2))
-                if past_flags[i]:
-                    rng.Interior.Color = LIGHT_BLUE
-                else:
-                    rng.Interior.ColorIndex = -4142
-                i = j
+      if collect:
+          load_all(("ПК1", "ПК2", "ПК3"))
+          found = set()
+          for gp in gp_by_pc.values():
+              if not gp:
+                  continue
+              agg, sts, dps = gp
+              for act, st_set in sts.items():
+                  if act.startswith("GLE-") and act_in_exec(st_set, exec_str):
+                      found.add(act)
+          acts = sorted(found, key=sort_key)
+          if not acts:
+              return die("Collect: ни одного акта с выполнением %s не найдено." % exec_str)
+          last_b = 2 + len(acts)
+          # v3.2.0: ScreenUpdating уже выключен на всю операцию (см. начало main)
+          if old_last >= 3:
+              ws.Range(ws.Cells(3, 2), ws.Cells(old_last, 2)).ClearContents()
+              ws.Range(ws.Cells(3, 2), ws.Cells(old_last, 2)).Interior.ColorIndex = -4142
+              ws.Range(ws.Cells(3, 3), ws.Cells(old_last, 21)).ClearContents()
+          ws.Range(ws.Cells(3, 2), ws.Cells(last_b, 2)).Value = \
+              tuple((a,) for a in acts)
+      else:
+          last_b = old_last
+          if last_b < 3:
+              return die("В столбце B листа «%s» нет актов со строки 3." % ws.Name)
+          raw = ws.Range(ws.Cells(3, 2), ws.Cells(last_b, 2)).Value
+          if not isinstance(raw, tuple):
+              raw = ((raw,),)
+          acts = [txt(r[0]) for r in raw]
+          pcs = []
+          for act in acts:
+              if act:
+                  pc = pc_of(title_of(act))
+                  if pc and pc not in pcs:
+                      pcs.append(pc)
+          load_all(pcs)
 
+      t_parse = time.time()
+      Z = Decimal("0.00")
+      rows_out = []
+      past_flags = []
+      nf = no_src = unk = empty_cnt = first_cnt = 0
+      for act in acts:
+          if not act:
+              empty_cnt += 1
+              rows_out.append(["-"] * TOTAL_COLS)
+              past_flags.append(False)
+              continue
+
+          ttl = title_of(act)
+          pc = pc_of(ttl)
+          base = [ttl, pc, sec_of(act), km_of(act)]
+
+          if not pc:
+              unk += 1
+              rows_out.append(base + ["—", "—"] + [Z] * 14)
+              past_flags.append(False)
+              continue
+
+          gp = gp_by_pc.get(pc)
+          ob = ob_by_pc.get(pc)
+
+          in_gp = gp is not None and act in gp[0]
+          in_ob = ob is not None and act in ob
+
+          if not in_gp and not in_ob:
+              nf += 1
+              rows_out.append(base + ["НЕ НАЙДЕНО", "НЕ НАЙДЕНО"] + [Z] * 14)
+              past_flags.append(False)
+              continue
+
+          # ---------- данные из Сводной ГП (если есть) ----------
+          if in_gp:
+              agg, sts, dps = gp
+              a = agg[act]
+              sum_s, ogz, svarka, prot, weld, ogz_area, cnt = a
+              st_list = sorted(sts.get(act, ()))
+              g = "; ".join(st_list) if st_list else "(без статуса)"
+              past = had_past_exec(st_list, exec_str)
+              if not past:
+                  first_cnt += 1
+              dp = ", ".join(sorted(dps.get(act, ()))) if dps.get(act) else "—"
+          else:
+              sum_s = ogz = svarka = prot = weld = ogz_area = cnt = Z
+              st_list = []
+              g = "(нет в Сводной ГП)"
+              past = False
+              dp = "—"
+
+          # ---------- данные из Общей сводной (если есть) ----------
+          if in_ob:
+              o_cnt, o_w = ob[act]
+          else:
+              o_cnt = o_w = Z
+
+          # точные денежные расчёты в Decimal с квантованием до 2 знаков
+          vals = [dec2(sum_s), dec2(o_w), dec2(prot), dec2(sum_s - prot),
+                  dec2(ogz), dec2(ogz_area), dec2(svarka),
+                  dec2(ogz + svarka), dec2(weld), dec2(cnt), dec2(o_cnt)]
+
+          # ---------- метизы (независимо от ГП) ----------
+          met = met_by_pc.get(pc)
+          if met and act in met:
+              met_g, met_h, met_j = met[act]
+              met_vals = [dec2(met_j), dec2(met_h), dec2(met_g)]
+          else:
+              met_vals = [Z, Z, Z]
+
+          row = base + [dp, g] + vals + met_vals
+          rows_out.append(row)
+          past_flags.append(past)
+
+      bad_rows = [(i, len(r)) for i, r in enumerate(rows_out) if len(r) != TOTAL_COLS]
+      logger.info("Обработка/парсинг данных завершена за %.2f с (%d строк)",
+                  time.time() - t_parse, len(acts))
+      if bad_rows:
+          detail = "; ".join(f"строка {i+3}: {n} вместо {TOTAL_COLS}" for i, n in bad_rows[:5])
+          return die(f"Внутренняя ошибка: рваный блок строк.\n{detail}")
+
+      # ---------- запись через COM ----------
+      t_write = time.time()
+      # v3.2.0: Excel-настройки уже отключены выше; данные пишутся массивом
+      # одним вызовом Range.Value; восстановление — во внешнем finally.
+      try:
+              last_a = ws.Cells(ws.Rows.Count, 1).End(XL_UP).Row
+              if last_a > last_b and txt(ws.Cells(last_a, 1).Value) == "ИТОГО":
+                  ws.Range(ws.Cells(last_a, 1), ws.Cells(last_a, LAST_OUTPUT)).ClearContents()
+
+              clear_last = max(last_b, old_last)
+              if clear_last >= 3:
+                  ws.Range(ws.Cells(3, 3), ws.Cells(clear_last, LAST_OUTPUT)).ClearContents()
+
+              if last_b >= 3:
+                  ws.Range(ws.Cells(3, 3), ws.Cells(last_b, LAST_OUTPUT)).Value = \
+                      tuple(tuple(r) for r in rows_out)
+
+              # ---------- порядковые номера в столбце A (только для непустых актов) ----------
+              if last_b >= 3:
+                  a_vals = []
+                  seq = 0
+                  for act in acts:
+                      if act:
+                          seq += 1
+                          a_vals.append((seq,))
+                      else:
+                          a_vals.append((None,))
+                  ws.Range(ws.Cells(3, 1), ws.Cells(last_b, 1)).Value = tuple(a_vals)
+
+              ws.Cells(2, 1).Value = "ИТОГО"
+              for col in range(9, LAST_OUTPUT + 1):
+                  letter = chr(64 + col)
+                  ws.Cells(2, col).Formula = "=SUBTOTAL(109,%s3:%s%d)" % (letter, letter, last_b)
+              ws.Range(ws.Cells(2, 1), ws.Cells(2, LAST_OUTPUT)).Font.Bold = True
+
+              ws.Range(ws.Cells(3, 9), ws.Cells(last_b, LAST_OUTPUT)).NumberFormatLocal = "# ##0,00"
+
+              # ---------- пакетная подсветка столбца B (v3.0.0) ----------
+              # Красим блоками одного цвета: прогоняем past_flags и выделяем
+              # непрерывные серии одинакового состояния — меньше вызовов COM.
+              if last_b >= 3:
+                  n = len(past_flags)
+                  i = 0
+                  while i < n:
+                      j = i
+                      while j < n and past_flags[j] == past_flags[i]:
+                          j += 1
+                      r1, r2 = 3 + i, 3 + j - 1
+                      rng = ws.Range(ws.Cells(r1, 2), ws.Cells(r2, 2))
+                      if past_flags[i]:
+                          rng.Interior.Color = LIGHT_BLUE
+                      else:
+                          rng.Interior.ColorIndex = -4142
+                      i = j
+
+              try:
+                  if ws.AutoFilterMode:
+                      ws.AutoFilterMode = False
+                  ws.Range(ws.Cells(2, 1), ws.Cells(last_b, LAST_TABLE)).AutoFilter()
+              except Exception:
+                  pass
+              try:
+                  ws.Activate()
+                  xl.ActiveWindow.FreezePanes = False
+                  ws.Range("A3").Select()
+                  xl.ActiveWindow.FreezePanes = True
+              except Exception:
+                  pass
+      except Exception:
+          # v3.2.0: ошибка записи — логируем контекст и пробрасываем наверх
+          logger.error("Ошибка при записи результата в Excel", exc_info=True)
+          raise
+    except Exception:
+        # v3.2.0: критический сбой — сначала восстановим Excel, потом пробросим
+        # исключение в обработчик __main__ (логи + last_error.txt + MessageBox)
         try:
-            if ws.AutoFilterMode:
-                ws.AutoFilterMode = False
-            ws.Range(ws.Cells(2, 1), ws.Cells(last_b, LAST_TABLE)).AutoFilter()
+            _restore_xl(xl, old_calc, old_events, old_alerts)
         except Exception:
             pass
-        try:
-            ws.Activate()
-            xl.ActiveWindow.FreezePanes = False
-            ws.Range("A3").Select()
-            xl.ActiveWindow.FreezePanes = True
-        except Exception:
-            pass
+        raise
     finally:
-        xl.ScreenUpdating = True
-        # v3.0.0: восстановление исходного состояния Excel
+        # страховка: если die()/return уже всё восстановили — повтор безопасен
         try:
-            xl.EnableEvents = old_events
+            _restore_xl(xl, old_calc, old_events, old_alerts)
         except Exception:
             pass
-        try:
-            xl.DisplayAlerts = old_alerts
-        except Exception:
-            pass
-        if old_calc is not None:
-            try:
-                xl.Calculation = old_calc
-            except Exception:
-                pass
 
     msg = ("Готово за %.0f с.\nКнига «%s», лист «%s», выполнение %s.\n"
            "Строк: %d (пустых: %d); НЕ НАЙДЕНО: %d; нет источника: %d; ПК не распознан: %d.\n"

@@ -30,6 +30,15 @@ import logging
 from logging.handlers import RotatingFileHandler
 from pathlib import Path as _Path
 
+# ------------------ Производительность (v3.2.0) ------------------
+PERF = {
+    "cache": True,        # кэш строк источников в памяти процесса
+                          # (один запуск; повторное чтение того же файла
+                          #  не ходит в сеть; инвалидация по mtime/размеру)
+    "cache_ttl": 300,     # страховка от «mtime не изменился, файл другой»
+                          # на сетевых шарах, сек
+}
+
 LOG = {
     "level": "INFO",              # DEBUG/INFO/WARNING/ERROR/CRITICAL
     "dir": "logs",                # папка относительно скрипта

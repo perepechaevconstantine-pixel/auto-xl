@@ -5,7 +5,7 @@ import sys
 
 # Пакет ставится как python-calamine, импортируется как python_calamine.
 # win32* требует pywin32 (Windows-only post-install скрипт не запускался?).
-mods = ['python_calamine', 'openpyxl', 'win32com', 'win32api', 'win32con']
+mods = ['python_calamine', 'win32com', 'win32api', 'win32con']
 failed = []
 for m in mods:
     try:

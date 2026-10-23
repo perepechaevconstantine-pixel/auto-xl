@@ -2,7 +2,7 @@
 """Тест импортов проекта «Анализ актов».
 
 Проверяет:
-  1. Все сторонние библиотеки (python_calamine, openpyxl, win32* на Windows).
+  1. Все сторонние библиотеки (python_calamine, win32* на Windows).
   2. API python_calamine, который использует act_analysis.py
      (CalamineWorkbook.from_path / get_sheet_by_name / to_python).
   3. Импорт модулей проекта: config, act_analysis (без запуска main()).
@@ -28,7 +28,7 @@ def check(name, fn):
 
 # ------------------ сторонние библиотеки ------------------
 check("python_calamine", lambda: importlib.import_module("python_calamine"))
-check("openpyxl", lambda: importlib.import_module("openpyxl"))
+
 
 if IS_WIN:
     for m in ("win32com", "win32api", "win32con", "win32com.client"):
