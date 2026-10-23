@@ -1,0 +1,25 @@
+Option Explicit
+
+Private Function PyExe() As String
+    Dim p As String
+    p = ThisWorkbook.Path & "\.venv\Scripts\python.exe"
+    If Dir(p) <> "" Then
+        PyExe = """" & p & """"
+    Else
+        PyExe = "python"
+    End If
+End Function
+
+Sub Êíîïêà_Îáíîâèòü()
+    ' Îáû÷íûé ðåæèì - áåðåò ñïèñîê àêòîâ èç ñòîëáöà B è çàïîëíÿåò C:Q
+    Dim cmd As String
+    cmd = PyExe & " """ & ThisWorkbook.Path & "\act_analysis.py"""
+    CreateObject("WScript.Shell").Run cmd, 1, True
+End Sub
+
+Sub Êíîïêà_Ïåðåñîáðàòü()
+    ' Ðåæèì collect - ñîáèðàåò âñå àêòû ñ òåêóùèì âûïîëíåíèåì èç 3 ÏÊ
+    Dim cmd As String
+    cmd = PyExe & " """ & ThisWorkbook.Path & "\act_analysis.py"" collect"
+    CreateObject("WScript.Shell").Run cmd, 1, True
+End Sub
