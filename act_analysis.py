@@ -1,13 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-Анализ актов v3.0.1 (основная ветка разработки, ревизия после восстановления v3.0.0).
+Анализ актов v3.0.2 (основная ветка разработки).
 История изменений — см. CHANGELOG.md.
-База: v3.0.0 (Decimal-расчёты, параллельное чтение, пакетная подсветка,
-             EnableEvents/DisplayAlerts save-restore, фикс quantize).
-Добавлено в v3.0.1:
-  - портативная конфигурация путей к источникам: config.py / config.json,
-    CLI-переопределение --gp/--ob, диалог выбора папок при первом запуске;
-  - папка logs/ с логом критических ошибок.
+База: v3.0.1 (портативная конфигурация config.py / config.json, CLI --gp/--ob, logs/).
+Добавлено в v3.0.2:
+  - версия скрипта печатается первой строкой в консоли при запуске.
 Запуск:
     python act_analysis.py                — обновить цифры для текущего списка в B
     python act_analysis.py collect        — пересобрать список актов из сводных
@@ -147,7 +144,7 @@ LAST_TABLE = 28                              # AB — все столбцы с �
 OGZ_PREFIXES = ("100б", "100н", "100холд")
 SPECIAL_PREFIXES = OGZ_PREFIXES + ("100дс",)
 
-VERSION = "3.0.1"
+VERSION = "3.0.2"
 
 CENT = Decimal("0.01")
 
@@ -397,6 +394,8 @@ def read_metizy(path):
 
 # ------------------ основной скрипт ------------------
 def main():
+    print("Анализ актов v" + VERSION)
+
     import win32api
     import win32con
     import win32com.client as wc
