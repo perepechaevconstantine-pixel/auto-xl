@@ -1,13 +1,19 @@
 # -*- coding: utf-8 -*-
 """
-Анализ актов v3.0.2 (основная ветка разработки).
+Анализ актов v3.1.0 (основная ветка разработки).
 История изменений — см. CHANGELOG.md.
-База: v3.0.1 (портативная конфигурация config.py / config.json, CLI --gp/--ob, logs/).
-Добавлено в v3.0.2:
-  - версия скрипта печатается первой строкой в консоли при запуске.
+База: v3.0.2 (портативная конфигурация, точные расчёты Decimal, параллельное чтение).
+Добавлено в v3.1.0:
+  - структурированное логирование через logging вместо print():
+    консоль (stderr) + logs/auto-xl.log (DEBUG) + logs/errors.log (ERROR+),
+    ротация 5 МБ x 3 бэкапа;
+  - флаг --quiet: в консоль только ошибки, файлы пишутся полностью;
+  - замеры времени ключевых этапов (чтение источников, сборка, запись);
+  - логирование аргументов запуска и конфигурации.
 Запуск:
     python act_analysis.py                — обновить цифры для текущего списка в B
     python act_analysis.py collect        — пересобрать список актов из сводных
+    python act_analysis.py --quiet ...    — тихий режим (в консоль только ошибки)
     python act_analysis.py --gp PATH --ob PATH [collect]  — переопределить пути
 """
 
@@ -16,9 +22,36 @@ import os
 import json
 import time
 import re
+import logging
 from pathlib import Path
 from decimal import Decimal, ROUND_HALF_UP
 from concurrent.futures import ThreadPoolExecutor
+
+logger = logging.getLogger(__name__)
+
+
+def _init_logging(quiet=False):
+    """Логгер инициализируется ОДИН раз через config.setup_logging().
+    Если config недоступен — минимальный fallback (только консоль), чтобы
+    скрипт не падал из-за конфигурации логирования."""
+    try:
+        import config as _cfg
+        if hasattr(_cfg, "setup_logging"):
+            return _cfg.setup_logging(quiet=quiet)
+    except Exception as e:
+        print("Не удалось инициализировать логирование из config.py (%s), "
+              "консольный режим по умолчанию" % e)
+    root = logging.getLogger()
+    root.setLevel(logging.DEBUG)
+    for h in list(root.handlers):
+        root.removeHandler(h)
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.ERROR if quiet else logging.INFO)
+    ch.setFormatter(logging.Formatter(
+        "%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"))
+    root.addHandler(ch)
+    return root
 
 # ------------------ настройки источников (портативные) ------------------
 # Источники подключаются шаблоном пути, где {pc} — номер Пункта Комплексной
@@ -57,7 +90,7 @@ def load_config():
             if py_gp or py_ob:
                 return py_gp or gp, py_ob or ob
         except Exception as e:
-            print("config.py не загружен (%s), используем config.json" % e)
+            logger.warning("config.py не загружен (%s), используем config.json", e)
     if CONFIG_JSON.exists():
         try:
             with open(CONFIG_JSON, encoding="utf-8") as f:
@@ -65,7 +98,7 @@ def load_config():
             gp = data.get("gp_template", gp)
             ob = data.get("ob_template", ob)
         except Exception as e:
-            print("config.json повреждён (%s), используем значения по умолчанию" % e)
+            logger.warning("config.json повреждён (%s), используем значения по умолчанию", e)
     return gp, ob
 
 
@@ -115,9 +148,9 @@ def ensure_paths_interactive(gp_tmpl, ob_tmpl):
             with open(CONFIG_JSON, "w", encoding="utf-8") as f:
                 json.dump({"gp_template": gp_tmpl, "ob_template": ob_tmpl},
                           f, ensure_ascii=False, indent=2)
-            print("Пути сохранены в", CONFIG_JSON)
+            logger.info("Пути сохранены в %s", CONFIG_JSON)
         except Exception as e:
-            print("Не удалось сохранить config.json:", e)
+            logger.error("Не удалось сохранить config.json: %s", e)
     return gp_tmpl, ob_tmpl
 
 
@@ -144,7 +177,7 @@ LAST_TABLE = 28                              # AB — все столбцы с �
 OGZ_PREFIXES = ("100б", "100н", "100холд")
 SPECIAL_PREFIXES = OGZ_PREFIXES + ("100дс",)
 
-VERSION = "3.0.2"
+VERSION = "3.1.0"
 
 CENT = Decimal("0.01")
 
@@ -394,7 +427,17 @@ def read_metizy(path):
 
 # ------------------ основной скрипт ------------------
 def main():
-    print("Анализ актов v" + VERSION)
+    print("Анализ актов v" + VERSION)  # первая строка консоли (добавлено в v3.0.2)
+
+    quiet = "--quiet" in sys.argv[1:]
+    _init_logging(quiet=quiet)
+    logger.info("Запуск с аргументами: %s", sys.argv[1:])
+    try:
+        import config as _cfg
+        logger.debug("Конфигурация LOG: %s", getattr(_cfg, "LOG", None))
+    except Exception:
+        pass
+    logger.debug("GP_TEMPLATE=%s | OB_TEMPLATE=%s", GP_TEMPLATE, OB_TEMPLATE)
 
     import win32api
     import win32con
@@ -403,6 +446,7 @@ def main():
     t0 = time.time()
 
     def die(msg, code=1):
+        logger.error(msg.replace("\n", " | "))
         win32api.MessageBox(0, msg, "Анализ актов v" + VERSION, win32con.MB_ICONERROR)
         print(msg)
         return code
@@ -424,6 +468,8 @@ def main():
             i += 1
         else:
             i += 1
+    logger.info("Режим: %s; ГП-шаблон: %s; ОБЩ-шаблон: %s",
+                "collect" if collect else "update", gp_tmpl, ob_tmpl)
 
     try:
         xl = wc.GetActiveObject("Excel.Application")
@@ -459,27 +505,38 @@ def main():
     def load_pc(pc):
         n = pc[2]
         t1 = time.time()
+        gp_path = gp_tmpl.format(pc=n)
         try:
-            gp_by_pc[pc] = read_gp(gp_tmpl.format(pc=n), exec_str)
+            logger.debug("Чтение ГП: %s", gp_path)
+            gp_by_pc[pc] = read_gp(gp_path, exec_str)
         except Exception as e:
             gp_by_pc[pc] = None
             warns.append("Нет источника ГП по %s (%s)." % (pc, e))
+            logger.warning("Нет источника ГП по %s", pc, exc_info=True)
         try:
-            ob_by_pc[pc] = read_ob(ob_tmpl.format(pc=n))
+            ob_path = ob_tmpl.format(pc=n)
+            logger.debug("Чтение Общей сводной: %s", ob_path)
+            ob_by_pc[pc] = read_ob(ob_path)
         except Exception as e:
             ob_by_pc[pc] = None
             warns.append("Нет источника Общей по %s (%s)." % (pc, e))
+            logger.warning("Нет источника Общей по %s", pc, exc_info=True)
         try:
-            met_by_pc[pc] = read_metizy(gp_tmpl.format(pc=n))
+            met_by_pc[pc] = read_metizy(gp_path)
         except Exception as e:
             met_by_pc[pc] = None
             warns.append("Нет листа Метизы по %s (%s)." % (pc, e))
-        print(pc, "read %.1fs" % (time.time() - t1))
+            logger.warning("Нет листа Метизы по %s", pc, exc_info=True)
+        elapsed = time.time() - t1
+        logger.info("%s: чтение источников завершено за %.1f с", pc, elapsed)
 
     def load_all(pcs):
         """v3.0.0: параллельное чтение источников по ПК (I/O-bound, сеть)."""
+        t_load = time.time()
+        logger.info("Загрузка файлов: параллельное чтение %d ПК", len(pcs))
         with ThreadPoolExecutor(max_workers=max(1, len(pcs))) as ex:
             list(ex.map(load_pc, pcs))
+        logger.info("Загрузка файлов завершена за %.2f с", time.time() - t_load)
 
     if collect:
         load_all(("ПК1", "ПК2", "ПК3"))
@@ -521,6 +578,7 @@ def main():
                     pcs.append(pc)
         load_all(pcs)
 
+    t_parse = time.time()
     Z = Decimal("0.00")
     rows_out = []
     past_flags = []
@@ -596,10 +654,13 @@ def main():
         past_flags.append(past)
 
     bad_rows = [(i, len(r)) for i, r in enumerate(rows_out) if len(r) != TOTAL_COLS]
+    logger.info("Обработка/парсинг данных завершена за %.2f с (%d строк)",
+                time.time() - t_parse, len(acts))
     if bad_rows:
         detail = "; ".join(f"строка {i+3}: {n} вместо {TOTAL_COLS}" for i, n in bad_rows[:5])
         return die(f"Внутренняя ошибка: рваный блок строк.\n{detail}")
     # ---------- запись через COM ----------
+    t_write = time.time()
     # v3.0.0: сохраняем исходное состояние Excel и отключаем события/диалоги
     old_calc = None
     try:
@@ -716,30 +777,32 @@ def main():
         msg += "\nСписок актов пересобран из сводных по всем ПК."
     if warns:
         msg += "\n\nПредупреждения:\n" + "\n".join(warns)
-    print(msg)
+    logger.info("Запись результата в Excel завершена за %.2f с", time.time() - t_write)
+    logger.info("Итог: строк=%d пустых=%d НЕ_НАЙДЕНО=%d нет_источника=%d "
+                "ПК_не_распознан=%d впервые=%d предупреждений=%d",
+                len(acts), empty_cnt, nf, no_src, unk, first_cnt, len(warns))
+    print(msg)  # финальный результат — всегда в консоль, даже в --quiet
     win32api.MessageBox(0, msg, "Анализ актов v" + VERSION, win32con.MB_ICONINFORMATION)
     return 0
 
 if __name__ == "__main__":
     try:
         sys.exit(main())
+    except SystemExit:
+        raise
     except Exception as exc:
-        import traceback
-        tb = traceback.format_exc()
+        # логгер мог ещё не инициализироваться (ошибка до main()) — инициируем
+        _init_logging(quiet="--quiet" in sys.argv[1:])
+        logger.critical("КРИТИЧЕСКАЯ ОШИБКА", exc_info=True)
+        tb = __import__("traceback").format_exc()
         here = Path(__file__).resolve().parent
         with open(here / "last_error.txt", "w", encoding="utf-8") as f:
             f.write(tb)
-        try:
-            logs = here / "logs"
-            logs.mkdir(exist_ok=True)
-            log_name = "error_" + time.strftime("%Y-%m-%d_%H%M%S") + ".log"
-            with open(logs / log_name, "w", encoding="utf-8") as f:
-                f.write(tb)
-        except Exception:
-            pass
         print("КРИТИЧЕСКАЯ ОШИБКА:\n" + tb)
-        print("\nОшибка записана в:", here / "last_error.txt")
+        print("\nОшибка записана в:", here / "last_error.txt",
+              "и в логи (logs/auto-xl.log, logs/errors.log)")
         try:
+            import win32api, win32con
             win32api.MessageBox(0, tb, "Анализ актов v" + VERSION, win32con.MB_ICONERROR)
         except Exception:
             pass

@@ -3,12 +3,12 @@ chcp 866 >nul
 setlocal enabledelayedexpansion
 
 rem ========================================================================
-rem install.bat - установка окружения для act_analysis (v3.0.2)
+rem install.bat - установка окружения для act_analysis (v3.1.0)
 rem ========================================================================
 
 echo.
 echo ========================================================================
-echo  Установка окружения для Анализ актов v3.0.2
+echo  Установка окружения для Анализ актов v3.1.0
 echo ========================================================================
 echo.
 
@@ -76,6 +76,11 @@ echo Проверка доступа к Excel ...
 copy /y "%SCRIPT_DIR%_check_excel.py" _check_excel.py >nul
 python _check_excel.py
 del /q _check_excel.py 2>nul
+echo.
+
+rem ----- создание папки логов -----
+if not exist "logs" mkdir "logs"
+if exist "logs" (echo Папка logs/ создана.) else (echo [ВНИМАНИЕ] Не удалось создать папку logs/.)
 echo.
 
 goto :ok_end
